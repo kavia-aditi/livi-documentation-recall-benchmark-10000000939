@@ -1,0 +1,156 @@
+---
+title: "LIVI Renderer IPC Bridge"
+sidebarTitle: "Renderer IPC"
+description: "Reference the preload bridge exposing window.projection and window.app globals, including exact channel mappings, queue behaviors, replay rules, and cleanup contracts."
+---
+
+The LIVI renderer preload bridge defines two globals for renderer windows: `projection` (projection and device control) and `app` (application, hardware, and update APIs). All main-process communication uses Electron `ipcRenderer` inside the preload. `invoke` methods are round-trip remote calls handled in the main process. `send` methods fire one-way messages with no acknowledgement. The main preload source is [`src/preload/index.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/preload/index.ts).
+
+## Globals
+
+| Global | Scope |
+| --- | --- |
+| `projection` | Projection lifecycle, transport, devices, audio, cluster, telemetry |
+| `app` | Platform info, updates, hardware radios, media keys, external URLs |
+
+Both are registered through `contextBridge.exposeInMainWorld` in the preload.
+
+## projection API inventory
+
+### Lifecycle (invoke)
+
+- `quit` maps to `quit`
+- `projection-start` maps to `ipc.start`
+- `projection-stop` maps to `ipc.stop`
+- `projection-restart` maps to `ipc.restart`
+- `projection-set-visible` maps to `ipc.setVisible(visible: boolean)`
+- `projection-sendframe` maps to `ipc.sendFrame`
+
+### Bluetooth (invoke)
+
+- `projection-bt-pairedlist-set` maps to `ipc.setBluetoothPairedList(listText: string)` returning `{ ok: boolean }`
+- `projection-bt-connect-device` maps to `ipc.connectBluetoothPairedDevice(mac: string)` returning `{ ok: boolean }`
+- `projection-bt-forget-device` maps to `ipc.forgetBluetoothPairedDevice(mac: string)` returning `{ ok: boolean }`
+
+### Transport (invoke)
+
+- `transport:switch` maps to `ipc.switchTransport()` returning `{ ok: boolean; active: 'aa' | 'cp' | null }`
+- `transport:state` maps to `ipc.getTransportState()` returning `TransportSnapshot`
+
+### Devices (invoke)
+
+- `devices:list` maps to `ipc.getDevices()` returning an array with status values `active`, `available`, or `offline`
+- `devices:select` maps to `ipc.selectDevice(id: string)` returning `{ ok: boolean }`
+- `devices:cycle` maps to `ipc.cycleSession()`
+- `devices:forget` maps to `ipc.forgetDevice(id: string)` returning `{ ok: boolean }`
+
+### Touch and commands (send)
+
+- `projection-touch` receives `ipc.sendTouch(x, y, action)`
+- `projection-multi-touch` receives `ipc.sendMultiTouch(points: MultiTouchPoint[])`
+- `projection-command` receives `ipc.sendCommand(key: string)`
+- `projection-set-volume` receives `ipc.setVolume(stream, volume)` where stream is `'music' | 'nav' | 'voiceAssistant' | 'call'`
+- `projection-set-visualizer-enabled` receives `ipc.setVisualizerEnabled(enabled: boolean)` with boolean coercion `!!enabled`
+
+### Settings (invoke)
+
+- `getSettings` maps to `settings.get()` returning `Config`
+- `save-settings` maps to `settings.save(partial: Partial<Config>)`
+
+### Audio hardware (invoke)
+
+- `audio:listSinks` and `audio:listSources` return arrays of `{ id, name, isDefault, offline? }`
+- `get-sysdefault-mic-label` maps to `usb.getSysdefaultPrettyName()` returning `string`
+
+### Cluster (invoke)
+
+- `cluster:request` maps to `ipc.requestCluster(enabled: boolean)` returning `{ ok: boolean; enabled: boolean }`
+- `cluster:repaint-nudge` maps to `ipc.clusterRepaintNudge()` returning `{ ok: boolean }` intended for macOS surface repaint
+
+### Read-once state (invoke)
+
+- `projection-media-read` maps to `ipc.readMedia()` returning `unknown`
+- `projection-navigation-read` maps to `ipc.readNavigation()` returning `unknown`
+- `telemetry:snapshot` maps to `ipc.getTelemetrySnapshot()` returning `unknown`
+
+### Event listeners
+
+`onUSBResetStatus` listens to both `usb-reset-start` and `usb-reset-done`, returning a cleanup that removes both listeners through `removeListener`.
+
+`settings.onUpdate` listens to `settings`. `settings.onLinkSpeed` listens to `link-speed`.
+
+## app API inventory
+
+### Platform properties
+
+- `platform` is `process.platform`
+- `compositor` is `process.env.LIVI_COMPOSITOR === '1'` using strict equality
+
+### Invoke methods
+
+| Method | Channel |
+| --- | --- |
+| `getVersion` | `app:getVersion` |
+| `listDisplayModes` | `app:listDisplayModes` |
+| `listWifiChannels` | `app:listWifiChannels` |
+| `listWifiCountryCodes` | `app:listWifiCountryCodes` |
+| `listWifiInterfaces` | `app:listWifiInterfaces` |
+| `listBtAdapters` | `app:listBtAdapters` |
+| `dongleRadios` | `app:dongleRadios` |
+| `switchDongleRadio(radio, on)` | `app:switchDongleRadio` |
+| `getLatestRelease` | `app:getLatestRelease` |
+| `performUpdate(imageUrl?)` | `app:performUpdate` |
+| `beginInstall` | `app:beginInstall` |
+| `abortUpdate` | `app:abortUpdate` |
+| `customPageUrl` | `app:customPageUrl` |
+| `customIconUrl` | `app:customIconUrl` |
+| `quitApp` | `app:quitApp` |
+| `restartApp` | `app:restartApp` |
+| `openExternal(url)` | `app:openExternal` |
+
+### Send methods
+
+- `notifyUserActivity` sends `app:user-activity`
+- `reportPath(path)` sends `ui:path`
+- `broadcastMediaKey(command)` sends `app:media-key`
+
+### Update events
+
+- `onUpdateEvent` listens to `update:event`
+- `onUpdateProgress` listens to `update:progress`
+
+Both wrap `IpcRendererEvent` and return cleanup functions using `removeListener`.
+
+## Queue behaviors and replay rules
+
+### First-subscriber drain queues (unbounded)
+
+USB events, projection events, and media-key events share first-subscriber queue behavior. When no handler is registered, events accumulate without bound. On the first subscription, the entire queue drains in order, then the queue is cleared.
+
+### Audio: sole handler, bounded 32, drop oldest
+
+Audio chunks use a single global slot `audioChunkHandler`. If no handler exists, chunks buffer to a maximum of 32 items; on overflow the oldest drops via `shift()`. When `onAudioChunk` is called, pending items drain through `forEach`, then the queue resets to an empty array. `offAudioChunk` clears the slot only when the passed handler matches the current one by reference equality.
+
+### Cluster: last-nonnull replay
+
+`lastClusterResolution` stores the most recent payload. On `onClusterResolution`, the handler array receives the new callback and immediately replays `lastClusterResolution` only if it is nonnull. There is no queue. Removal is by reference equality.
+
+### Telemetry: no replay, no queue
+
+`telemetryHandlers` is a plain array. `onTelemetry` pushes the handler. `offTelemetry` removes by filter. Events broadcast on `telemetry:update` immediately. Late subscribers miss all prior updates.
+
+### Media key string filter
+
+Before enqueueing or delivering, the handler validates `typeof command === 'string' && !!command`. Non-string or empty commands are silently discarded.
+
+### Boolean coercion
+
+Only `setVisualizerEnabled` coerces its argument with `!!enabled`. All other boolean parameters pass through unchanged.
+
+## Cleanup contracts
+
+Most listeners return a zero-arity cleanup. `onUSBResetStatus` removes two listeners. `onAudioChunk` and `onClusterResolution` push into arrays and return functions that filter by reference equality. `mediaKeyHandlers` removal uses `splice(indexOf(handler), 1)`.
+
+## Unknowns
+
+Main process handler schemas, argument validation, and security policies are not present in the preload and are Unknown. The runtime contracts of `TransportSnapshot`, `Config`, and `MultiTouchPoint` depend on files outside the copied bundle. Whether `invoke` rejections propagate unmodified is not determined.

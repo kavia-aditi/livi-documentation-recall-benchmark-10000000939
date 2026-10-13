@@ -1,0 +1,113 @@
+---
+title: "Telemetry Ingestion and State Propagation"
+sidebarTitle: "Telemetry"
+description: "How the TelemetryStore merges partial payloads, how the Socket broadcasts snapshots, and how the preload bridge forwards updates to renderer code."
+---
+
+The telemetry system receives partial vehicle data, merges it into a shared state, and pushes updates to renderer clients. It consists of three layers: a merge store ([`TelemetryStore`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/telemetry/TelemetryStore.ts)), a Socket.IO transport ([`TelemetrySocket`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/Socket.ts)), and a preload bridge ([`src/preload/index.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/preload/index.ts)).
+
+## Merge semantics in TelemetryStore
+
+[`TelemetryStore.merge`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/telemetry/TelemetryStore.ts#L22-L55) accepts a partial payload and produces a new snapshot.
+
+**Guard rules**
+
+| Incoming value | Behavior |
+| --- | --- |
+| `null`, `undefined`, non-object, array | Return immediately, no-op |
+| Empty object (`{}`) | Return immediately, no-op |
+| Top-level field is `undefined` | Skipped, never written |
+| Top-level field is `null` | Replaced into snapshot |
+| Field key is `gps` or `can` **and** value is a plain object | Merged field-by-field with existing sub-object |
+| All other fields | Overwritten (replace-on-write) |
+
+`timestamp` behavior: `ts` is special. If `patch.ts` is `undefined`, the store sets `next.ts = Date.now()`. If `patch.ts` is `null`, that `null` is preserved. The emitted patch also receives the snapshot `ts` when its own `ts` is `undefined`.
+
+**Emitted patch vs snapshot**
+
+For `gps` and `can`, the emitted `'change'` patch carries the merged sub-block, not the incoming delta. For all other keys, the patch carries the incoming value exactly. This lets listeners receive complete, consistent sub-objects without knowing merge rules.
+
+**Snapshot is shallow**
+
+[`snapshot()`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/telemetry/TelemetryStore.ts#L16-L18) returns a shallow copy (`{ ...this._snapshot }`). Nested objects are aliased. Modifying a nested reference mutates the store's internal state. There is no equality deduplication: identical consecutive payloads still emit `'change'`.
+
+**Reset behavior**
+
+[`reset()`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/telemetry/TelemetryStore.ts#L57-L59) clears `_snapshot` to `{}` and removes all listeners only if they were externally removed. Calling `reset()` without first unsubscribing listeners leaves them registered.
+
+**Example nested merge**
+
+```typescript
+store.merge({ gps: { lat: 1 }, ts: undefined });
+// _snapshot becomes { gps: { lat: 1 }, ts: <Date.now()> }
+// emitted patch is { gps: { lat: 1 }, ts: <same timestamp> }
+
+store.merge({ gps: { lon: 2 } });
+// _snapshot becomes { gps: { lat: 1, lon: 2 }, ts: <new Date.now()> }
+```
+
+## Socket transport
+
+[`TelemetrySocket`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/Socket.ts) starts a server immediately inside the constructor.
+
+**Construction defaults**
+
+- Port: `4000`
+- CORS: `{ origin: '*' }`
+- No host binding or auth is configured in this file
+
+**Connection handshake**
+
+On each `connection`, the server emits the current snapshot only if it is non-empty (`Object.keys(snapshot).length > 0`). New clients therefore miss prior `'change'` events unless the snapshot already contains data.
+
+**Inbound path**
+
+```text
+client emits 'telemetry:push' -> socket.on -> store.merge(payload)
+```
+
+**Outbound path**
+
+```text
+store 'change' -> io.emit('telemetry:update', snapshot)
+```
+
+All connected clients receive every snapshot, regardless of which client pushed the original telemetry.
+
+**Error and lifecycle behavior**
+
+- HTTP server errors are logged with `console.error`; there is no retry or reconnect logic.
+- [`disconnect()`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/Socket.ts#L63-L78) removes the store listener, closes the `Server`, then closes the `http.Server`, resolving after both close callbacks fire.
+- [`connect()`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/Socket.ts#L80-L83) waits `200 ms`, then calls `startServer()` again. There is no guard against duplicate starts. Reliability of delayed reconnection is not guaranteed.
+
+## Preload bridge
+
+The renderer does not open the socket directly. It receives telemetry through the Electron preload API exposed at `window.projection`.
+
+**Registration**
+
+- `onTelemetry(handler)` appends a handler to `telemetryHandlers`.
+- `offTelemetry(handler)` filters out the matching reference.
+- `getTelemetrySnapshot()` invokes `'telemetry:snapshot'` via `ipcRenderer.invoke`. The main-side handler for that channel is not present in the reviewed files.
+
+**Forwarding rules**
+
+```typescript
+ipcRenderer.on('telemetry:update', (_event, payload: unknown) => {
+  telemetryHandlers.forEach((handler) => handler(payload))
+})
+```
+
+- Payloads are forwarded as `unknown`; no schema validation occurs.
+- There is no replay queue. If no handler is registered when the event arrives, the payload is lost.
+- Whether the main process actually emits `'telemetry:update'` over IPC depends on code outside the reviewed files. The direct path from `TelemetrySocket` to renderer is therefore not established.
+
+## Boundary summary
+
+| Capability | Status |
+| --- | --- |
+| Merge guards | Exact, no inference |
+| Socket auth | Unknown |
+| IPC snapshot channel handler | Unknown |
+| Renderer socket access | Not asserted |
+| Retry / replay | Not guaranteed |

@@ -1,0 +1,98 @@
+---
+title: "Native Media Framing Protocol"
+sidebarTitle: "Native Media"
+description: "Wire format, record structure, and frame assembly logic for the native media stream delivered from livi-host-proto."
+---
+
+The native pipeline streams video, audio, and codec announcements over a simple length-prefixed binary protocol. The implementation lives in [`feed.rs`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/native/livi-host-proto/rust/src/feed.rs).
+
+## Wire layout
+
+Every record on the wire is:
+
+| Segment | Bytes | Type | Notes |
+| --- | --- | --- | --- |
+| `len` | 4 | `u32` native endian | Counts the header plus payload, **not** including these 4 bytes |
+| `kind` | 1 | `u8` | Record discriminant |
+| `id` | 4 | `u32` native endian | Stream identifier |
+| `ts` | 8 | `u64` native endian | Timestamp (units unknown) |
+| `payload` | `len - 13` | bytes | Variable length, may be zero bytes |
+
+Total header is `13` bytes. The `len` field must be at least `13`; smaller values are discarded. All multibyte fields use **native endianness** (`to_ne_bytes` / `from_ne_bytes`).
+
+## Record kinds
+
+The source defines four constants; no validation rejects unknown values during parsing:
+
+| Constant | Value | Meaning | Payload semantics |
+| --- | --- | --- | --- |
+| `KIND_VIDEO` | `1` | Video access unit | Codec data for stream `id` |
+| `KIND_AUDIO` | `2` | Audio samples | Samples for stream `id` |
+| `KIND_VIDEO_START` | `3` | Codec announcement | One byte: `0` = H.264, `1` = H.265 |
+| `KIND_MIC` | `4` | Microphone tap | Captured mic samples |
+
+Comments note the payloads but do not enforce them. Unknown `kind` values pass through the framer without error.
+
+## Framer API
+
+[`Framer`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/native/livi-host-proto/rust/src/feed.rs) collects chunks and yields complete [`Record`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/native/livi-host-proto/rust/src/feed.rs) objects.
+
+### Methods
+
+- `Framer::new()` / `Framer::default()` creates an empty buffer.
+- `push(&mut self, chunk: &[u8])` appends bytes.
+- `next_record(&mut self) -> Option<Record>` scans the buffer and returns the first complete record, or `None` if data is insufficient.
+
+### Processing rules
+
+1. If the buffer has fewer than 4 bytes, return `None`.
+2. Read `len` as native `u32`; if the buffer has fewer than `4 + len` bytes, return `None`.
+3. If `len < 13`, drain `4 + len` bytes and continue (skip the short record).
+4. Parse `kind`, `id`, `ts` from the 13-byte header.
+5. Copy payload bytes `[4 + 13 .. 4 + len]` into `record.payload`.
+6. Drain consumed bytes from the buffer and return `Some(record)`.
+
+**Fragmented input** is accepted transparently: partial chunks are buffered until the full record arrives. **Coalesced input** (multiple records in one chunk) is also supported: repeated calls to `next_record` drain one record per invocation.
+
+### Encode
+
+```rust
+pub fn encode(kind: u8, id: u32, ts: u64, payload: &[u8]) -> Vec<u8>
+```
+
+- Computes `len = 13 + payload.len()`.
+- Writes `len` as native `u32`. This narrows `usize` to `u32` without checked conversion; very large payloads may wrap silently.
+- Appends `kind`, `id`, `ts`, and payload.
+
+## Boundary and failure behavior
+
+| Capability | Status |
+| --- | --- |
+| Maximum record size | No limit enforced |
+| Checksum or CRC | None |
+| Resync on corruption | None; short records are skipped, but bad lengths consume arbitrary bytes |
+| EOF / timeout / buffer cap | Not implemented |
+| Timestamp units | Unknown |
+| Audio payload formats | Unknown |
+| ID assignment semantics | Unknown |
+| Codecs for decoding | H.264 / H.265 constants defined; actual decode path is outside this file |
+| Zero-length payload | Valid (produces empty `Vec<u8>`) |
+| Unknown kind values | Pass through without error |
+
+Also note: the raw source bundle contains stray `U+0001` characters before `drain` calls in `feed.rs`. Compileability of the raw bundle as shipped has not been established; the logic documented here reflects the intended readable implementation rather than an executable guarantee.
+
+## Test scenarios
+
+The module tests cover five supported behaviors:
+
+1. **Round-trip record**: encode a `KIND_VIDEO` record, push it, and recover the same fields.
+2. **Split reassembly**: one record split into 5-byte fragments yields a 40-byte payload.
+3. **Coalesced records**: two records in one chunk are returned in order.
+4. **Short skip**: a `len = 3` record is discarded; the following valid record is still parsed.
+5. **Empty payload**: a record with zero payload bytes is accepted.
+
+```rust
+let mut f = Framer::new();
+f.push(&encode(KIND_VIDEO, 0x7a00_0001, 42, &[1, 2, 3]));
+assert_eq!(f.next_record(), Some(Record { kind: 1, id: 0x7a00_0001, ts: 42, payload: vec![1,2,3] }));
+```

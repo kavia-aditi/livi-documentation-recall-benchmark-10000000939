@@ -1,0 +1,159 @@
+---
+title: "Configuration Loading and DefaultsConfiguration Loading and Defaults"
+sidebarTitle: "Configuration"
+description: "How LIVI boots configuration from live JSON, falls back to a backup mirror, applies host-derived and panel-derived defaults, and writes the corrected file back.How LIVI boots configuration from live JSON, falls back to a backup mirror, applies host-derived and panel-derived defaults, and writes the corrected file back."
+---
+
+LIVI reads its runtime configuration from a JSON file on disk. If the live file is missing, the loader checks a backup mirror. The loader also derives default values for the car name and projection dimensions when they are absent, then validates, corrects, and persists the result.
+
+The implementation lives entirely in [`loadConfig.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/config/loadConfig.ts). Imported helpers (`validate`, `writeConfig`, `configForFile`, `sysfsPanelGeometry`, `isPagePath`, and constants such as `DEFAULT_CONFIG`, `CAR_NAME_MAX`, `WIFI_PASSWORD_MIN`, and `WIFI_PASSWORD_MAX`) are defined in files that are not present in this source bundle, so their exact behavior is **Unknown**.
+
+## Source selection order
+
+The loader chooses a source path using strict priority:
+
+1. `CONFIG_PATH` if it exists on disk.
+2. `CONFIG_BACKUP_PATH` if the live file is missing and the backup exists.
+3. No file if neither exists.
+
+If the backup is used, a log line is emitted: `[config] restored from backup mirror`.
+
+## Parse failure handling
+
+If a chosen file exists but `JSON.parse` throws, the loader prints a warning with the exception and continues with an empty file config. There is **no** second attempt to read the backup when the live file is corrupt. The resulting config is built entirely from defaults and any corrections applied later.
+
+## Car name default
+
+When the parsed file lacks `carName`, the host `hostname()` is split on the first dot, trimmed, and used if it is non-empty and not equal to `localhost` (case-insensitive). Otherwise the default falls back to `DEFAULT_CONFIG.carName`. The value is truncated with `CAR_NAME_MAX`, whose concrete value is **Unknown**.
+
+## Projection defaults from panel
+
+If **both** `projectionWidth` and `projectionHeight` are undefined in the file, the loader calls `sysfsPanelGeometry` to read panel dimensions. If a panel is returned, the scale factor is:
+
+```typescript
+Math.min(1280 / panel.widthPx, 720 / panel.heightPx, 1)
+```
+
+The scaled width and height are rounded to the nearest even integer via `2 * Math.round(value / 2)`. These values are written into `defaults.projectionWidth`, `defaults.projectionHeight`, `defaults.clusterWidth`, and `defaults.clusterHeight`. If either projection dimension was already present in the file, the panel probe is skipped entirely.
+
+## Validation and corrections
+
+After merging file values over defaults, the loader runs an external `validate(fileConfig, defaults)` function whose rules are **Unknown**. It then performs two client-visible corrections:
+
+| Field | Rule | Fallback |
+| --- | --- | --- |
+| `wifiPassword` | Length must be within `WIFI_PASSWORD_MIN..WIFI_PASSWORD_MAX` | `DEFAULT_CONFIG.wifiPassword` |
+| `startPage` | Must satisfy `isPagePath()` | `DEFAULT_CONFIG.startPage` |
+
+The Wi-Fi bounds constants and the default password are **Unknown**.
+
+## Write-back semantics
+
+The loader computes `needWrite` when either the live config is missing, or the serialized form of the original file config differs from the serialized form of `configForFile(merged)`. When true, it calls `writeConfig(merged)` and logs the write. Failures inside `writeConfig` are uncaught at this level.
+
+## Unknown boundaries
+
+- Complete config schema and all default values.
+- `validate` rules and the set of fields it strips or coerces.
+- `CAR_NAME_MAX`, `WIFI_PASSWORD_MIN`, `WIFI_PASSWORD_MAX`.
+- Hostname portability on non-POSIX systems.
+- Panel EDID failure modes when `sysfsPanelGeometry` returns null.
+
+<CardGroup cols={2}>
+  <Card title="Transport Arbitration" icon="shuffle" href="/quickstart">
+    How the arbiter ranks candidates and resolves overrides.
+  </Card>
+
+  <Card title="Telemetry" icon="activity" href="/guides/telemetry">
+    Merge store and Socket.IO broadcast pipeline.
+  </Card>
+
+  <Card title="Updates" icon="download" href="/guides/updates">
+    Download, install, and relaunch flow.
+  </Card>
+
+  <Card title="Renderer IPC" icon="computer" href="/guides/renderer-ipc">
+    Preload bridge and event queues.
+  </Card>
+
+  <Card title="Native Media" icon="film" href="/guides/native-media">
+    Binary framing for video and audio records.
+  </Card>
+</CardGroup>
+
+LIVI reads its runtime configuration from a JSON file on disk. If the live file is missing, the loader checks a backup mirror. The loader also derives default values for the car name and projection dimensions when they are absent, then validates, corrects, and persists the result.
+
+The implementation lives entirely in [`loadConfig.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/config/loadConfig.ts). Imported helpers (`validate`, `writeConfig`, `configForFile`, `sysfsPanelGeometry`, `isPagePath`, and constants such as `DEFAULT_CONFIG`, `CAR_NAME_MAX`, `WIFI_PASSWORD_MIN`, and `WIFI_PASSWORD_MAX`) are defined in files that are not present in this source bundle, so their exact behavior is **Unknown**.
+
+## Source selection order
+
+The loader chooses a source path using strict priority:
+
+1. `CONFIG_PATH` if it exists on disk.
+2. `CONFIG_BACKUP_PATH` if the live file is missing and the backup exists.
+3. No file if neither exists.
+
+If the backup is used, a log line is emitted: `[config] restored from backup mirror`.
+
+## Parse failure handling
+
+If a chosen file exists but `JSON.parse` throws, the loader prints a warning with the exception and continues with an empty file config. There is **no** second attempt to read the backup when the live file is corrupt. The resulting config is built entirely from defaults and any corrections applied later.
+
+## Car name default
+
+When the parsed file lacks `carName`, the host `hostname()` is split on the first dot, trimmed, and used if it is non-empty and not equal to `localhost` (case-insensitive). Otherwise the default falls back to `DEFAULT_CONFIG.carName`. The value is truncated with `CAR_NAME_MAX`, whose concrete value is **Unknown**.
+
+## Projection defaults from panel
+
+If **both** `projectionWidth` and `projectionHeight` are undefined in the file, the loader calls `sysfsPanelGeometry` to read panel dimensions. If a panel is returned, the scale factor is:
+
+```typescript
+Math.min(1280 / panel.widthPx, 720 / panel.heightPx, 1)
+```
+
+The scaled width and height are rounded to the nearest even integer via `2 * Math.round(value / 2)`. These values are written into `defaults.projectionWidth`, `defaults.projectionHeight`, `defaults.clusterWidth`, and `defaults.clusterHeight`. If either projection dimension was already present in the file, the panel probe is skipped entirely.
+
+## Validation and corrections
+
+After merging file values over defaults, the loader runs an external `validate(fileConfig, defaults)` function whose rules are **Unknown**. It then performs two client-visible corrections:
+
+| Field | Rule | Fallback |
+| --- | --- | --- |
+| `wifiPassword` | Length must be within `WIFI_PASSWORD_MIN..WIFI_PASSWORD_MAX` | `DEFAULT_CONFIG.wifiPassword` |
+| `startPage` | Must satisfy `isPagePath()` | `DEFAULT_CONFIG.startPage` |
+
+The Wi-Fi bounds constants and the default password are **Unknown**.
+
+## Write-back semantics
+
+The loader computes `needWrite` when either the live config is missing, or the serialized form of the original file config differs from the serialized form of `configForFile(merged)`. When true, it calls `writeConfig(merged)` and logs the write. Failures inside `writeConfig` are uncaught at this level.
+
+## Unknown boundaries
+
+- Complete config schema and all default values.
+- `validate` rules and the set of fields it strips or coerces.
+- `CAR_NAME_MAX`, `WIFI_PASSWORD_MIN`, `WIFI_PASSWORD_MAX`.
+- Hostname portability on non-POSIX systems.
+- Panel EDID failure modes when `sysfsPanelGeometry` returns null.
+
+<CardGroup cols={2}>
+  <Card title="Transport Arbitration" icon="shuffle" href="/quickstart">
+    How the arbiter ranks candidates and resolves overrides.
+  </Card>
+
+  <Card title="Telemetry" icon="activity" href="/guides/telemetry">
+    Merge store and Socket.IO broadcast pipeline.
+  </Card>
+
+  <Card title="Updates" icon="download" href="/guides/updates">
+    Download, install, and relaunch flow.
+  </Card>
+
+  <Card title="Renderer IPC" icon="computer" href="/guides/renderer-ipc">
+    Preload bridge and event queues.
+  </Card>
+
+  <Card title="Native Media" icon="film" href="/guides/native-media">
+    Binary framing for video and audio records.
+  </Card>
+</CardGroup>

@@ -1,0 +1,73 @@
+---
+title: "Transport Arbiter Selection Logic"
+sidebarTitle: "Transport Arbitration"
+description: "How TransportArbiter ranks wired and wireless candidates, resolves overrides, and decides which phone projection transport to start or switch to."
+---
+
+[`TransportArbiter`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/services/projection/transport/TransportArbiter.ts) chooses between Android Auto (AA) and CarPlay (CP) transports, each in wired or wireless mode. It never starts a transport on its own; it only produces a ranked `Candidate` for the caller to act on.
+
+The class depends on `ArbiterDeps`, `candidateEquals`, and several types imported from `./types`. Those files are absent from this bundle, so their exact contracts are **Unknown**.
+
+## Candidate ranking
+
+`detectedCandidates()` returns candidates in this fixed order:
+
+1. Wired AA if a wired AA session exists.
+2. Wired CP if a wired CP session exists.
+3. Wireless AA if wireless is enabled and either a wireless phone is in range **or** a wired AA session is active.
+
+Wireless CP is **never** advertised as a candidate by this implementation.
+
+## Preference resolution
+
+`pickPreferred()` resolves in this order:
+
+1. **Override** — if `setOverride()` was called and the override still appears in `detectedCandidates()`, return it. Otherwise clear the override and continue.
+2. **Current** — if a transport is currently active and its candidate is still detected, keep it.
+3. **First detected** — return `detectedCandidates()[0]`.
+
+If no candidates exist, `pickPreferred()` returns `null`, and `decideNextStart()` returns `{ kind: 'none' }`.
+
+## Native candidate predicate
+
+`hasNativeCandidate()` is stricter than `detectedCandidates()`:
+
+- Returns `true` immediately if a wired AA or wired CP session exists.
+- Otherwise returns `true` only if wireless is enabled **and** a wireless phone is in range.
+
+The wired-AA-is-active condition used in `detectedCandidates()` is **not** part of `hasNativeCandidate()`.
+
+## Switching
+
+`prepareSwitch()` rotates through detected candidates:
+
+- If fewer than two candidates exist, it returns `{ ok: false, target: currentCandidate() }` and mutates nothing.
+- The anchor is `currentCandidate()` if one exists; otherwise it is `pickPreferred()`.
+- It finds the anchor index in `detectedCandidates()`, then selects the next candidate modulo length.
+- The result becomes the override, `resetNativeProbeDefer()` is called, and `deps.onChange()` is fired.
+
+`setOverride(candidate)` sets the override directly, resets the probe defer state, and calls `deps.onChange()`.
+
+## Snapshot semantics
+
+`getSnapshot()` reports:
+
+| Field | Source |
+| --- | --- |
+| `active` | `deps.getActiveTransport()` |
+| `targetTransport` / `targetMode` | Override if set, otherwise current candidate |
+| `switchPending` | `true` when override is set and differs from current candidate |
+| `wiredPhoneDetected` | Wired AA or wired CP session exists |
+| `wirelessPhoneDetected` | Wireless enabled and (in range, wireless active now, or wired AA active) |
+| `wiredPhoneActive` | Active transport is wired |
+| `wirelessPhoneActive` | Active transport exists and is not wired |
+
+## Probe timers
+
+The class declares `nativeProbeDeferred`, `nativeProbeStartedAt`, and `nativeProbeDeadline`, but no method in this file reads or writes the deadline or started-at fields except via `resetNativeProbeDefer()`. Any timeout behavior is **Unknown**.
+
+## Unknown boundaries
+
+- Equality rules inside `candidateEquals`.
+- Exact behavior of `deps.onChange()` and the full `ArbiterDeps` interface.
+- How the caller acts on `decideNextStart()` or `prepareSwitch()` results.

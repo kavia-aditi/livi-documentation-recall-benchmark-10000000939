@@ -1,0 +1,135 @@
+---
+title: "LIVI Software Update Session Lifecycle"
+sidebarTitle: "Software Updates"
+description: "Reference the update session states, feed fetch, download progress, redirect handling, install branching, and abort cleanup in the main process updater and downloader modules."
+---
+
+LIVI software updates use a singleton session object driven by a state machine in the main process. The core source files are [`src/main/ipc/update/updater.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/ipc/update/updater.ts) and [`src/main/ipc/update/downloader.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/ipc/update/downloader.ts). A stray control character sequence appears before the `export class Updater` declaration in `updater.ts`; the raw bundle compileability is not established here.
+
+## Session state model
+
+The module exports `Updater` with a shared module-level `updateSession` object storing:
+
+- `state`: `UpdateSessionState` values `idle | downloading | ready | installing`
+- `tmpFile?: string`
+- `cancel?: () => void`
+- `platform?: 'darwin' | 'linux'`
+
+The session starts in `idle`. Every `performUpdate` call first asserts `state === 'idle'`; if not, it throws immediately. The `abort` handler always transitions back to `idle` and sends an error event.
+
+## Feed fetch and URL selection
+
+The `perform` method accepts an optional `directUrl` string. If empty, it calls `releaseFeedUrl(this.runtimeState.config.updateNightly === true)` to build a feed URL, then fetches with a `User-Agent: LIVI-updater` header. If `res.ok` fails, it throws `feed ${res.status}`. The response parses as a `GhRelease` JSON, then `pickAssetForPlatform` selects the asset URL from `json.assets || []`. If no URL resolves, it throws `No asset found for platform`.
+
+Supported platforms are `darwin` and `linux` only. Any other `process.platform` reports `Unsupported platform` through `sendUpdateEvent` and returns without changing state.
+
+## Download behavior
+
+After URL resolution, the temporary file path is built as `join(os.tmpdir(), 'pcu-${Date.now()}${suffix}')` where `suffix` is `.dmg` on darwin and `.AppImage` on linux.
+
+`downloadWithProgress` from [`src/main/ipc/update/downloader.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/ipc/update/downloader.ts) is called with the URL, destination path, and a progress callback that emits `received`, `total`, and `percent` to renderer windows via `sendUpdateProgress`.
+
+### Redirect handling
+
+The downloader uses `https.get`. If `res.statusCode >= 300` and `res.headers.location` is truthy, the current request is destroyed and a new `downloadWithProgress` is started recursively against `res.headers.location`. There is no redirect count limit. The cancellation handle chains through `redirectCancel` so a top-level abort also cancels the current active request. Relative redirect resolution behavior is not specified in the downloader.
+
+### Progress semantics
+
+`percent` is `received / total` when `total > 0`; otherwise it is `0`. `total` comes from `parseInt(String(res.headers['content-length'] || 0), 10)`. If the header is absent or zero, progress stays at `0` percent while bytes still arrive.
+
+### Errors and cancellation cleanup
+
+On any error before the response body begins, `safeReject` fires once. After body streaming starts, the stream `error` and file write `error` events also route to `safeReject`. The `cancel` function sets `cancelled = true`, chains `redirectCancel?.()`, then calls `cleanup()`. Cleanup destroys the request and write stream, unlinks the destination file if it exists, and finally calls `safeReject(new Error('aborted'))`.
+
+Because `safeReject` may be guarded by `cancelled` checks in some paths, there is a duplication risk: `abortUpdate` in the updater also sends `{ phase: 'error', message: 'Aborted' }`, so a cancelled download can produce multiple abort notifications. Additionally, the download promise rejection is a late catch race against the explicit session cleanup inside `abort`.
+
+## Ready and install branches
+
+When `await promise` completes, state transitions to `ready` and an event with `phase: 'ready'` is emitted. Installation does not begin automatically.
+
+When the renderer calls `beginInstall` (channel `app:beginInstall`), the updater checks `state === 'ready'`, `tmpFile` exists, and `platform` is known. State transitions to `installing`.
+
+### macOS path
+
+On darwin, the updater first attempts `this.services.projectionService.stop()`. Failure emits a console warning and continues. A 150 millisecond pause follows, then `installOnMacFromFile(file)` runs. No relaunch or success event is emitted from this branch in the visible source.
+
+### Linux path
+
+On linux, `installOnLinuxFromFile(file)` runs, then `sendUpdateEvent({ phase: 'relaunching' })` is emitted, followed by `restartApp(this.runtimeState, this.services)`.
+
+## Abort handler
+
+`abortUpdate` (channel `app:abortUpdate`) checks the session state. If `downloading`, it invokes `updateSession.cancel`. If `ready`, it attempts to unlink `updateSession.tmpFile`. In the `finally` block, it unconditionally sets `updateSession = { state: 'idle' }` and emits `{ phase: 'error', message: 'Aborted' }`.
+
+## Preload update APIs
+
+The preload exposes `app.performUpdate(imageUrl?)`, `app.beginInstall`, `app.abortUpdate`, `app.onUpdateEvent`, and `app.onUpdateProgress`. `performUpdate` receives the URL and maps to `app:performUpdate`. Events flow on channels `update:event` and `update:progress` via `ipcRenderer.on`, with cleanup via `removeListener`.
+
+## Unknowns
+
+The exact shape of `GhRelease`, `pickAssetForPlatform`, `releaseFeedUrl`, `installOnMacFromFile`, and `installOnLinuxFromFile` are Unknown because their implementations reside in files not present in the copied bundle. Integrity verification, feed selection UI, installer restart helpers, and explicit success-to-idle reset behavior after a successful install are also Unknown.
+
+LIVI software updates use a singleton session object driven by a state machine in the main process. The core source files are [`src/main/ipc/update/updater.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/ipc/update/updater.ts) and [`src/main/ipc/update/downloader.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/ipc/update/downloader.ts). A stray control character sequence appears before the `export class Updater` declaration in `updater.ts`; the raw bundle compileability is not established here.
+
+## Session state model
+
+The module exports `Updater` with a shared module-level `updateSession` object storing:
+
+- `state`: `UpdateSessionState` values `idle | downloading | ready | installing`
+- `tmpFile?: string`
+- `cancel?: () => void`
+- `platform?: 'darwin' | 'linux'`
+
+The session starts in `idle`. Every `performUpdate` call first asserts `state === 'idle'`; if not, it throws immediately. The `abort` handler always transitions back to `idle` and sends an error event.
+
+## Feed fetch and URL selection
+
+The `perform` method accepts an optional `directUrl` string. If empty, it calls `releaseFeedUrl(this.runtimeState.config.updateNightly === true)` to build a feed URL, then fetches with a `User-Agent: LIVI-updater` header. If `res.ok` fails, it throws `feed ${res.status}`. The response parses as a `GhRelease` JSON, then `pickAssetForPlatform` selects the asset URL from `json.assets || []`. If no URL resolves, it throws `No asset found for platform`.
+
+Supported platforms are `darwin` and `linux` only. Any other `process.platform` reports `Unsupported platform` through `sendUpdateEvent` and returns without changing state.
+
+## Download behavior
+
+After URL resolution, the temporary file path is built as `join(os.tmpdir(), 'pcu-${Date.now()}${suffix}')` where `suffix` is `.dmg` on darwin and `.AppImage` on linux.
+
+`downloadWithProgress` from [`src/main/ipc/update/downloader.ts`](https://github.com/kavia-aditi/livi-documentation-recall-benchmark-10000000939/blob/main/src/main/ipc/update/downloader.ts) is called with the URL, destination path, and a progress callback that emits `received`, `total`, and `percent` to renderer windows via `sendUpdateProgress`.
+
+### Redirect handling
+
+The downloader uses `https.get`. If `res.statusCode >= 300` and `res.headers.location` is truthy, the current request is destroyed and a new `downloadWithProgress` is started recursively against `res.headers.location`. There is no redirect count limit. The cancellation handle chains through `redirectCancel` so a top-level abort also cancels the current active request. Relative redirect resolution behavior is not specified in the downloader.
+
+### Progress semantics
+
+`percent` is `received / total` when `total > 0`; otherwise it is `0`. `total` comes from `parseInt(String(res.headers['content-length'] || 0), 10)`. If the header is absent or zero, progress stays at `0` percent while bytes still arrive.
+
+### Errors and cancellation cleanup
+
+On any error before the response body begins, `safeReject` fires once. After body streaming starts, the stream `error` and file write `error` events also route to `safeReject`. The `cancel` function sets `cancelled = true`, chains `redirectCancel?.()`, then calls `cleanup()`. Cleanup destroys the request and write stream, unlinks the destination file if it exists, and finally calls `safeReject(new Error('aborted'))`.
+
+Because `safeReject` may be guarded by `cancelled` checks in some paths, there is a duplication risk: `abortUpdate` in the updater also sends `{ phase: 'error', message: 'Aborted' }`, so a cancelled download can produce multiple abort notifications. Additionally, the download promise rejection is a late catch race against the explicit session cleanup inside `abort`.
+
+## Ready and install branches
+
+When `await promise` completes, state transitions to `ready` and an event with `phase: 'ready'` is emitted. Installation does not begin automatically.
+
+When the renderer calls `beginInstall` (channel `app:beginInstall`), the updater checks `state === 'ready'`, `tmpFile` exists, and `platform` is known. State transitions to `installing`.
+
+### macOS path
+
+On darwin, the updater first attempts `this.services.projectionService.stop()`. Failure emits a console warning and continues. A 150 millisecond pause follows, then `installOnMacFromFile(file)` runs. No relaunch or success event is emitted from this branch in the visible source.
+
+### Linux path
+
+On linux, `installOnLinuxFromFile(file)` runs, then `sendUpdateEvent({ phase: 'relaunching' })` is emitted, followed by `restartApp(this.runtimeState, this.services)`.
+
+## Abort handler
+
+`abortUpdate` (channel `app:abortUpdate`) checks the session state. If `downloading`, it invokes `updateSession.cancel`. If `ready`, it attempts to unlink `updateSession.tmpFile`. In the `finally` block, it unconditionally sets `updateSession = { state: 'idle' }` and emits `{ phase: 'error', message: 'Aborted' }`.
+
+## Preload update APIs
+
+The preload exposes `app.performUpdate(imageUrl?)`, `app.beginInstall`, `app.abortUpdate`, `app.onUpdateEvent`, and `app.onUpdateProgress`. `performUpdate` receives the URL and maps to `app:performUpdate`. Events flow on channels `update:event` and `update:progress` via `ipcRenderer.on`, with cleanup via `removeListener`.
+
+## Unknowns
+
+The exact shape of `GhRelease`, `pickAssetForPlatform`, `releaseFeedUrl`, `installOnMacFromFile`, and `installOnLinuxFromFile` are Unknown because their implementations reside in files not present in the copied bundle. Integrity verification, feed selection UI, installer restart helpers, and explicit success-to-idle reset behavior after a successful install are also Unknown.

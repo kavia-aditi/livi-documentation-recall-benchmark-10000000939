@@ -1,0 +1,29 @@
+{
+  "theme": "palm",
+  "name": "LIVI Developer Documentation",
+  "colors": {
+    "primary": "#2563EB",
+    "light": "#60A5FA",
+    "dark": "#1D4ED8"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Configuration And State",
+        "pages": [
+          "index",
+          "quickstart",
+          "guides/telemetry"
+        ]
+      },
+      {
+        "group": "Runtime Interfaces",
+        "pages": [
+          "guides/updates",
+          "guides/renderer-ipc",
+          "guides/native-media"
+        ]
+      }
+    ]
+  }
+}
