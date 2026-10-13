@@ -1,0 +1,141 @@
+---
+title: "Configuration Loading"
+description: "How LIVI resolves, merges, and validates runtime configuration from live files, backup mirrors, and adaptive defaults."
+sidebarTitle: "Configuration"
+---
+
+LIVI's configuration system bootstraps the head unit from a JSON file on disk. It prefers a live config, falls back to a backup mirror, and adapts defaults based on the host environment and display panel. This page describes the resolution order, merging rules, and post-load corrections applied by [`loadConfig()`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/config/loadConfig.ts).
+
+## Resolution order
+
+`loadConfig()` selects its source file in strict priority:
+
+| Priority | Path | Condition |
+| --- | --- | --- |
+| 1 | `CONFIG_PATH` (live config) | file exists |
+| 2 | `CONFIG_BACKUP_PATH` (backup mirror) | live missing, backup exists |
+| 3 | none | both missing; use defaults only |
+
+If the backup is used, the function logs a restore message. A parse failure on either file falls back to defaults with a warning; there is **no** retry or second-source attempt.
+
+## Adaptive defaults
+
+Defaults are merged after file loading. Two fields adapt dynamically:
+
+### `carName`
+
+When the file omits `carName`, LIVI derives it from the machine hostname via `hostname().split('.')[0].trim()`. If the result is empty or equals `localhost`, the hardcoded `DEFAULT_CONFIG.carName` is used instead. The final value is capped to `CAR_NAME_MAX` characters. This prevents multiple stock head units from advertising the same Bluetooth and Wi-Fi name.
+
+### Display dimensions
+
+When **both** `projectionWidth` and `projectionHeight` are undefined, LIVI queries the physical panel geometry via `sysfsPanelGeometry()`. The values are computed as follows:
+
+- Compute a scale factor: `min(1280 / width, 720 / height, 1)`
+- Multiply panel dimensions by the scale
+- Round each result to the nearest **even** integer
+- Assign the same rounded pair to both projection and cluster defaults
+
+This guarantees a viewport between 720p and the panel's native size, preserving aspect ratio. A 1920 x 1080 panel produces 1280 x 720. A 1280 x 720 panel passes through unchanged.
+
+## Validation and corrections
+
+After merging file values over defaults, `validate()` normalizes the config. Its implementation is not part of this file. Two additional corrections run after validation:
+
+### Wi-Fi password bounds
+
+The final `wifiPassword` length is checked against `WIFI_PASSWORD_MIN` and `WIFI_PASSWORD_MAX`. If it falls outside the bounds, the field is replaced with `DEFAULT_CONFIG.wifiPassword` and a warning is emitted.
+
+### Start page path
+
+`merged.startPage` is passed to `isPagePath()`. If it is not a recognized route, the value reverts to `DEFAULT_CONFIG.startPage` with a warning.
+
+## Persistence
+
+`loadConfig()` writes the normalized config back to disk when either:
+
+- the live config file does not exist, **or**
+- the stringified input `fileConfig` differs from `configForFile(merged)`
+
+`configForFile()` strips or reorders fields before comparison; its exact mapping is not shown here. `writeConfig()` handles the actual write, backup, and atomicity logic, which is also not shown here. Calls to `writeConfig()` are **not** wrapped in a try/catch block inside `loadConfig()`, so exceptions propagate to the caller.
+
+No file watcher is registered; subsequent external changes to `config.json` are not detected until the next process restart.
+
+## Merge precedence
+
+The effective config is built from:
+
+1. `DEFAULT_CONFIG` base
+2. adaptive defaults (`carName` from host, display from panel)
+3. parsed file values overlaid on top
+4. `validate()` merge and normalization
+5. hard bounds corrections (Wi-Fi password, start page)
+
+Fields that are explicitly present in the file always survive; only undefined fields receive adaptive defaults.
+
+LIVI's configuration system bootstraps the head unit from a JSON file on disk. It prefers a live config, falls back to a backup mirror, and adapts defaults based on the host environment and display panel. This page describes the resolution order, merging rules, and post-load corrections applied by [`loadConfig()`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/config/loadConfig.ts).
+
+## Resolution order
+
+`loadConfig()` selects its source file in strict priority:
+
+| Priority | Path | Condition |
+| --- | --- | --- |
+| 1 | `CONFIG_PATH` (live config) | file exists |
+| 2 | `CONFIG_BACKUP_PATH` (backup mirror) | live missing, backup exists |
+| 3 | none | both missing; use defaults only |
+
+If the backup is used, the function logs a restore message. A parse failure on either file falls back to defaults with a warning; there is **no** retry or second-source attempt.
+
+## Adaptive defaults
+
+Defaults are merged after file loading. Two fields adapt dynamically:
+
+### `carName`
+
+When the file omits `carName`, LIVI derives it from the machine hostname via `hostname().split('.')[0].trim()`. If the result is empty or equals `localhost`, the hardcoded `DEFAULT_CONFIG.carName` is used instead. The final value is capped to `CAR_NAME_MAX` characters. This prevents multiple stock head units from advertising the same Bluetooth and Wi-Fi name.
+
+### Display dimensions
+
+When **both** `projectionWidth` and `projectionHeight` are undefined, LIVI queries the physical panel geometry via `sysfsPanelGeometry()`. The values are computed as follows:
+
+- Compute a scale factor: `min(1280 / width, 720 / height, 1)`
+- Multiply panel dimensions by the scale
+- Round each result to the nearest **even** integer
+- Assign the same rounded pair to both projection and cluster defaults
+
+This guarantees a viewport between 720p and the panel's native size, preserving aspect ratio. A 1920 x 1080 panel produces 1280 x 720. A 1280 x 720 panel passes through unchanged.
+
+## Validation and corrections
+
+After merging file values over defaults, `validate()` normalizes the config. Its implementation is not part of this file. Two additional corrections run after validation:
+
+### Wi-Fi password bounds
+
+The final `wifiPassword` length is checked against `WIFI_PASSWORD_MIN` and `WIFI_PASSWORD_MAX`. If it falls outside the bounds, the field is replaced with `DEFAULT_CONFIG.wifiPassword` and a warning is emitted.
+
+### Start page path
+
+`merged.startPage` is passed to `isPagePath()`. If it is not a recognized route, the value reverts to `DEFAULT_CONFIG.startPage` with a warning.
+
+## Persistence
+
+`loadConfig()` writes the normalized config back to disk when either:
+
+- the live config file does not exist, **or**
+- the stringified input `fileConfig` differs from `configForFile(merged)`
+
+`configForFile()` strips or reorders fields before comparison; its exact mapping is not shown here. `writeConfig()` handles the actual write, backup, and atomicity logic, which is also not shown here. Calls to `writeConfig()` are **not** wrapped in a try/catch block inside `loadConfig()`, so exceptions propagate to the caller.
+
+No file watcher is registered; subsequent external changes to `config.json` are not detected until the next process restart.
+
+## Merge precedence
+
+The effective config is built from:
+
+1. `DEFAULT_CONFIG` base
+2. adaptive defaults (`carName` from host, display from panel)
+3. parsed file values overlaid on top
+4. `validate()` merge and normalization
+5. hard bounds corrections (Wi-Fi password, start page)
+
+Fields that are explicitly present in the file always survive; only undefined fields receive adaptive defaults.

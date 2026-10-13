@@ -1,0 +1,255 @@
+---
+title: "Renderer IPC API Reference"
+sidebarTitle: "Renderer IPC"
+description: "Complete reference for the window.projection and window.app preload APIs, including channel mapping, subscription policies, and the invoke/send distinction."
+---
+
+LIVI exposes two global objects to the renderer via [`contextBridge`](https://www.electronjs.org/docs/latest/api/context-bridge): `window.projection` and `window.app`. Both are implemented in [`src/preload/index.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/preload/index.ts). This page documents every method, its IPC channel, and the buffering and replay rules that govern each subscription family.
+
+## Invoke versus send
+
+`invoke` is used for round-trip calls that return a `Promise`. `send` is used for fire-and-forget messages. There is no automatic reply for `send`; the main process must emit a separate event if a response is needed.
+
+| Mode | Electron API | Typical use |
+| --- | --- | --- |
+| Request/response | `ipcRenderer.invoke` | Settings reads, device lists, transport switching |
+| Fire-and-forget | `ipcRenderer.send` | Touch input, volume changes, activity pings |
+
+## Global object comparison
+
+Most projection and USB logic lives on `window.projection`. Platform metadata, system lists, and update/application controls live on `window.app`.
+
+|  | `window.projection` | `window.app` |
+| --- | --- | --- |
+| Projection lifecycle | Yes | No |
+| Touch/volume/media control | Yes | No |
+| Settings, audio device enumeration | Yes | No |
+| Platform and update surface | No | Yes |
+| System list queries (Wi-Fi, Bluetooth, displays) | No | Yes |
+| Media keys (listen and broadcast) | No | Yes |
+
+The `appApi.compositor` flag is read from `process.env.LIVI_COMPOSITOR === '1'`; `appApi.platform` is `process.platform`.
+
+## Subscription families and buffering policies
+
+The preload layer implements four distinct policies for renderer-side subscriptions.
+
+| Family | Channel | Queue type | Size/replay | Note |
+| --- | --- | --- | --- | --- |
+| USB events | `usb-event` | Unbounded queue | First subscriber drains all queued events | [`src/preload/index.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/preload/index.ts) (usbEventQueue) |
+| Projection events | `projection-event` | Unbounded queue | First subscriber drains all queued events | [`src/preload/index.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/preload/index.ts) (projectionEventQueue) |
+| Media keys | `app:media-key` | Unbounded queue of strings | First subscriber drains all queued commands | [`src/preload/index.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/preload/index.ts) (mediaKeyQueue) |
+| Audio chunks | `projection-audio-chunk` | Bounded queue | Latest 32, drained once on first handler | [`src/preload/index.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/preload/index.ts) (audioChunkQueue) |
+| Cluster resolution | `cluster-video-resolution` | Latest non-null value | Replayed to every new subscriber | [`src/preload/index.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/preload/index.ts) (lastClusterResolution) |
+| Telemetry | `telemetry:update` | None | No replay, broadcast to all handlers | [`src/preload/index.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/preload/index.ts) (telemetryHandlers) |
+
+All unbounded queues (USB, projection, media keys) buffer indefinitely until a subscriber appears. The audio queue is capped at 32 entries to prevent memory growth in windows that never show the visualizer. Telemetry has no queue and no replay; only real-time subscribers receive updates.
+
+## window.projection
+
+### Lifecycle and visibility
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `start` | `(): Promise<void>` | invoke | `projection-start` |
+| `stop` | `(): Promise<void>` | invoke | `projection-stop` |
+| `restart` | `(): Promise<void>` | invoke | `projection-restart` |
+| `setVisible` | `(visible: boolean): Promise<void>` | invoke | `projection-set-visible` |
+| `sendFrame` | `(): Promise<void>` | invoke | `projection-sendframe` |
+
+### Bluetooth paired-device helpers
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `setBluetoothPairedList` | `(listText: string): Promise<{ ok: boolean }>` | invoke | `projection-bt-pairedlist-set` |
+| `connectBluetoothPairedDevice` | `(mac: string): Promise<{ ok: boolean }>` | invoke | `projection-bt-connect-device` |
+| `forgetBluetoothPairedDevice` | `(mac: string): Promise<{ ok: boolean }>` | invoke | `projection-bt-forget-device` |
+
+### Transport and devices
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `switchTransport` | `(): Promise<{ ok: boolean; active: 'aa' \| 'cp' \| null }>` | invoke | `transport:switch` |
+| `getTransportState` | `(): Promise<TransportSnapshot>` | invoke | `transport:state` |
+| `getDevices` | `(): Promise<Device[]>` | invoke | `devices:list` |
+| `selectDevice` | `(id: string): Promise<{ ok: boolean }>` | invoke | `devices:select` |
+| `cycleSession` | `(): Promise<void>` | invoke | `devices:cycle` |
+| `forgetDevice` | `(id: string): Promise<{ ok: boolean }>` | invoke | `devices:forget` |
+
+`Device` objects include `id`, optional `name`, `model`, `protocol`, `lastTransport`, `status` (`'active'`, `'available'`, or `'offline'`), plus optional phone metadata fields: `batteryLevel`, `batteryCharging`, `signalStrength`, and `carrierName`.
+
+### Touch, commands, and events
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `sendTouch` | `(x: number, y: number, action: number): void` | send | `projection-touch` |
+| `sendMultiTouch` | `(points: MultiTouchPoint[]): void` | send | `projection-multi-touch` |
+| `sendCommand` | `(key: string): void` | send | `projection-command` |
+| `onEvent` | `(callback: ApiCallback): () => void` | listener | `projection-event` |
+
+`onEvent` returns an unsubscribe function. The first subscriber drains any queued projection events and the queue is cleared afterward.
+
+### Media and navigation
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `readMedia` | `(): Promise<unknown>` | invoke | `projection-media-read` |
+| `readNavigation` | `(): Promise<unknown>` | invoke | `projection-navigation-read` |
+
+### Audio sink/source listing
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `listSinks` | `(): Promise<AudioDevice[]>` | invoke | `audio:listSinks` |
+| `listSources` | `(): Promise<AudioDevice[]>` | invoke | `audio:listSources` |
+
+`AudioDevice` shape is `{ id: string; name: string; isDefault: boolean; offline?: boolean }`.
+
+### Volume and visualizer
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `setVolume` | `(stream: StreamKind, volume: number): void` | send | `projection-set-volume` |
+| `setVisualizerEnabled` | `(enabled: boolean): void` | send | `projection-set-visualizer-enabled` |
+
+`StreamKind` is `'music'`, `'nav'`, `'voiceAssistant'`, or `'call'`.
+
+### Audio chunk subscription
+
+| Method | Signature | Policy |
+| --- | --- | --- |
+| `onAudioChunk` | `(handler: ChunkHandler): void` | Single handler, bounded 32 |
+| `offAudioChunk` | `(handler: ChunkHandler): void` | Clears handler if it matches |
+
+Only one handler can be registered at a time. Calling `onAudioChunk` replaces the previous handler and drains the current queue into the new handler. The payload shape is `unknown`; the main process defines the chunk format.
+
+### Cluster
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `requestCluster` | `(enabled: boolean): Promise<{ ok: boolean; enabled: boolean }>` | invoke | `cluster:request` |
+| `clusterRepaintNudge` | `(): Promise<{ ok: boolean }>` | invoke | `cluster:repaint-nudge` |
+| `onClusterResolution` | `(handler: ChunkHandler): () => void` | listener | `cluster-video-resolution` |
+
+`clusterRepaintNudge` is documented in source as macOS-only; it moves the window by one pixel to force a surface repaint for transparent-window cluster planes.
+
+`onClusterResolution` replays the latest non-null payload to every new subscriber, so a late subscriber immediately knows whether a cluster stream is active.
+
+### Telemetry
+
+| Method | Signature | Policy |
+| --- | --- | --- |
+| `onTelemetry` | `(handler: (payload: unknown) => void): void` | Broadcast, no replay |
+| `offTelemetry` | `(handler: (payload: unknown) => void): void` | Removes matching handler |
+| `getTelemetrySnapshot` | `(): Promise<unknown>` | invoke (`telemetry:snapshot`) |
+
+### Settings
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `settings.get` | `(): Promise<Config>` | invoke | `getSettings` |
+| `settings.save` | `(settings: Partial<Config>): Promise<void>` | invoke | `save-settings` |
+| `settings.onUpdate` | `(callback: ApiCallback<[Config]>): () => void` | listener | `settings` |
+| `settings.onLinkSpeed` | `(callback: ApiCallback): () => void` | listener | `link-speed` |
+
+`onLinkSpeed` emits a live Wi-Fi link readout. The payload is `null` while no dongle or phone is on the air.
+
+### USB
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `usb.getSysdefaultPrettyName` | `(): Promise<string>` | invoke | `get-sysdefault-mic-label` |
+| `usb.listenForEvents` | `(callback: ApiCallback): () => void` | listener | `usb-event` |
+
+`listenForEvents` uses the unbounded USB queue. The first subscriber drains the entire backlog.
+
+### USB reset status
+
+| Method | Signature | Channels |
+| --- | --- | --- |
+| `onUSBResetStatus` | `(callback: ApiCallback): () => void` | `usb-reset-start`, `usb-reset-done` |
+
+One callback receives both events. The unsubscribe function removes the listener from both channels.
+
+### Global quit
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `quit` | `(): Promise<void>` | invoke | `quit` |
+
+## window.app
+
+### Platform metadata
+
+| Property | Type | Source |
+| --- | --- | --- |
+| `platform` | `NodeJS.Platform` | `process.platform` |
+| `compositor` | `boolean` | `process.env.LIVI_COMPOSITOR === '1'` |
+
+`compositor` indicates whether the process is running under a compositor path, not whether a compositor is available on the host.
+
+### System queries
+
+| Method | Signature | Main channel |
+| --- | --- | --- |
+| `getVersion` | `(): Promise<string>` | `app:getVersion` |
+| `listDisplayModes` | `(): Promise<string[]>` | `app:listDisplayModes` |
+| `listWifiChannels` | `(): Promise<number[]>` | `app:listWifiChannels` |
+| `listWifiCountryCodes` | `(): Promise<string[]>` | `app:listWifiCountryCodes` |
+| `listWifiInterfaces` | `(): Promise<string[]>` | `app:listWifiInterfaces` |
+| `listBtAdapters` | `(): Promise<string[]>` | `app:listBtAdapters` |
+| `dongleRadios` | `(): Promise<{ wifi: boolean \| null; bt: boolean \| null }>` | `app:dongleRadios` |
+| `switchDongleRadio` | `(radio: 'wifi' \| 'bt', on: boolean): Promise<void>` | `app:switchDongleRadio` |
+
+### Updates
+
+| Method | Signature | Main channel |
+| --- | --- | --- |
+| `getLatestRelease` | `(): Promise<{ version?: string; url?: string }>` | `app:getLatestRelease` |
+| `performUpdate` | `(imageUrl?: string): Promise<void>` | `app:performUpdate` |
+| `beginInstall` | `(): Promise<void>` | `app:beginInstall` |
+| `abortUpdate` | `(): Promise<void>` | `app:abortUpdate` |
+
+### Update events
+
+| Method | Signature | Channel | Payload |
+| --- | --- | --- | --- |
+| `onUpdateEvent` | `(cb: (payload: UpdateEvent) => void): () => void` | `update:event` | `{ phase: string; message?: string }` |
+| `onUpdateProgress` | `(cb: (payload: UpdateProgress) => void): () => void` | `update:progress` | `{ phase?: string; percent?: number; received?: number; total?: number }` |
+
+### Application control
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `quitApp` | `(): Promise<void>` | invoke | `app:quitApp` |
+| `restartApp` | `(): Promise<void>` | invoke | `app:restartApp` |
+| `openExternal` | `(url: string): Promise<{ ok: boolean; error?: string }>` | invoke | `app:openExternal` |
+| `customPageUrl` | `(): Promise<string \| null>` | invoke | `app:customPageUrl` |
+| `customIconUrl` | `(): Promise<string \| null>` | invoke | `app:customIconUrl` |
+
+### Activity and path reporting
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `notifyUserActivity` | `(): void` | send | `app:user-activity` |
+| `reportPath` | `(path: string): void` | send | `ui:path` |
+
+### Media keys
+
+| Method | Signature | Mode | Main channel |
+| --- | --- | --- | --- |
+| `broadcastMediaKey` | `(command: string): void` | send | `app:media-key` |
+| `onMediaKey` | `(handler: (command: string) => void): () => void` | listener | `app:media-key` |
+
+`broadcastMediaKey` sends a command to the main process, which then broadcasts it back to all renderer listeners via the same channel. `onMediaKey` uses the unbounded media-key queue. The first subscriber drains all queued commands.
+
+## Remaining unknowns
+
+The preload file only declares the renderer side of each channel. The following are not present in the bundle and are treated as unknown:
+
+- Main process handlers for every channel listed above (implementation, payload validation, and error responses).
+- Internal payload definitions, value ranges, and security boundaries.
+- `Config`, `TransportSnapshot`, and `MultiTouchPoint` field-level definitions.
+- Whether any `invoke` handler enforces schema validation before replying.
+
+Only shapes explicitly written in `src/preload/index.ts` are guaranteed.

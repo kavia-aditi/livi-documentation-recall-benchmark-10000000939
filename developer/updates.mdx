@@ -1,0 +1,146 @@
+---
+title: "Software Update Flow, Concurrency, and Platform Installer Dispatch"
+sidebarTitle: "Software Updates"
+description: "Internal rules of the LIVI auto-updater, including download state management, platform branching to Linux and macOS installers, progress event wiring, and known concurrency caveats."
+---
+
+The LIVI updater is a shared-session, manual-trigger flow that downloads a platform asset and then dispatches to one of two native installers. This page describes the internal state machine, event wire-up, and the concurrency edges that exist in the current implementation.
+
+## Shared session state
+
+One module-level object enforces single-update-at-a-time semantics.
+
+```ts
+let updateSession: {
+  state: UpdateSessionState
+  tmpFile?: string
+  cancel?: () => void
+  platform?: 'darwin' | 'linux'
+} = { state: 'idle' }
+```
+
+- `state` transitions are: `idle` -> `downloading` -> `ready` -> `installing`, with `idle` always reached after any terminal or error path.
+- `tmpFile` is the temp path used for the downloaded asset.
+- `cancel` is the downloader cancellation handle.
+
+Source: `src/main/ipc/update/updater.ts`, lines 15-21
+
+## URL resolution: direct vs. feed
+
+[`Updater#perform`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/ipc/update/updater.ts) accepts an optional `directUrl`.
+
+| Input | Behavior |
+| --- | --- |
+| `directUrl` provided | Used verbatim as the download target. |
+| No `directUrl` | Performs a feed fetch using `releaseFeedUrl(runtimeState.config.updateNightly === true)`. The boolean comparison is strict: `undefined` and `false` both resolve to `false`. |
+
+When the feed path is used, the updater:
+
+1. Fetches the feed with `User-Agent: LIVI-updater`.
+2. Parses the response as a `GhRelease`.
+3. Passes `json.assets || []` to `pickAssetForPlatform`.
+4. Continues only if a non-empty `url` is returned.
+
+Missing or unexpected feed contents, asset lists, or picker results surface as runtime errors and transition state back to `idle`.
+
+Source: `src/main/ipc/update/updater.ts`, lines 35-46
+
+## Platform restrictions and temp suffix
+
+Only `darwin` and `linux` are supported. Any other `process.platform` emits an `error` event and returns immediately.
+
+The temp file suffix is chosen by platform:
+
+| Platform | Suffix |
+| --- | --- |
+| darwin | `.dmg` |
+| linux | `.AppImage` |
+
+The temp path is built under `os.tmpdir()` with a `pcu-${Date.now()}` prefix.
+
+Source: `src/main/ipc/update/updater.ts`, lines 30-33, 50-51
+
+## Download progress fraction
+
+The downloader reports progress as a fraction, not 0-100:
+
+```ts
+// percent is 1 when the download is complete for a known content-length
+({ received, total, percent: total ? received / total : 0 })
+```
+
+- When `content-length` is absent, `total` becomes `0` and `percent` stays `0` for the entire transfer.
+- The updater forwards this directly through `sendUpdateProgress({ phase: 'download', received, total, percent })`.
+
+Source: `src/main/ipc/update/downloader.ts`, lines 51-52; `src/main/ipc/update/updater.ts`, lines 54-58
+
+## Ready, install, abort, and error events
+
+Events are emitted via `sendUpdateEvent` at the following phases:
+
+| Phase | Trigger |
+| --- | --- |
+| `start` | `perform` begins and passes the idle check. |
+| `ready` | The download promise resolves. |
+| `installing` | `install()` is invoked and the file exists. |
+| `relaunching` | Linux install completes; app restart follows. |
+| `error` | Any exception, cancellation, or platform rejection. |
+
+The `abort` handler behaves differently depending on current state:
+
+- `downloading`: Invokes `updateSession.cancel()`, which internally calls the downloader cancel, resets state to `idle`, and emits an `error` event with message `Aborted`.
+- `ready`: Deletes `tmpFile` if it exists, resets state to `idle`, and emits `error: Aborted`.
+- Any other state (including `installing`): Falls through to the same reset and `error: Aborted` emission, but does **not** stop an in-flight install.
+
+Source: `src/main/ipc/update/updater.ts`, lines 64-110
+
+## Linux vs macOS branches
+
+During install, the updater branches by `updateSession.platform`:
+
+- **macOS**: Before running the DMG installer, it attempts `services.projectionService.stop()`. If stop fails, the warning is logged and install continues. After `projectionService.stop()`, the updater waits a fixed `150ms` before calling `installOnMacFromFile`. macOS install does **not** relaunch automatically.
+- **Linux**: Skips projection teardown and calls `installOnLinuxFromFile` directly. On success it emits `relaunching` and calls `restartApp(runtimeState, services)`.
+
+If `install` is called while state is not `ready`, or if `tmpFile`/`platform` are missing, it throws immediately.
+
+Source: `src/main/ipc/update/updater.ts`, lines 96-112
+
+## Downloader internals
+
+[`downloadWithProgress`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/ipc/update/downloader.ts) uses `https.get` and enforces these behaviors:
+
+- **Redirect handling**: If the response has `statusCode >= 300` and a `Location` header, the current request is destroyed and the function recurses on the new URL. There is no explicit redirect depth limit, and relative `Location` resolution is not provided in the code.
+- **Exact 200**: Any non-redirect status other than `200` rejects with `HTTP ${statusCode}`.
+- **File finish and close**: On response end, the file write stream is closed before resolving. The close is awaited via `file.close(() => r())`.
+- **Cancellation propagation**: `cancel()` sets a flag, destroys the request and file stream, attempts to `unlink(dest)`, and then rejects the returned promise with `aborted`.
+- **Ordinary errors**: Non-cancellation errors (network, file system, HTTP status) reject the promise. There is **no** automatic cleanup of partial files on ordinary errors, and there is **no** timeout, retry, or integrity verification in the supplied code.
+
+Source: `src/main/ipc/update/downloader.ts`, lines 10-92
+
+## Concurrency caveats
+
+The updater has several shared-state edges that callers should understand:
+
+1. **State stays idle during feed lookup**: Between the idle check and setting `state = 'downloading'`, the updater performs an async feed fetch and asset resolution. During that window the session remains `idle`, so a second concurrent call to `perform` could pass the guard until the first sets the state. The only guard is the synchronous `if (updateSession.state !== 'idle')` at the top of `perform`.
+2. **In-progress rejection resets shared state**: Any error during `perform` (including fetch failure, missing asset, or network error) overwrites the entire `updateSession` object to `{ state: 'idle' }`. An old pending promise from a prior call may still resolve or reject against a newer session object.
+3. **Abort emits duplicate error events**: Calling `abort` in the `ready` state emits an `error` event with `Aborted`, then resets state. If the caller also listens to the downloader's own cancellation error, the same abort may surface through multiple paths.
+4. **No cancellation during installing, and abort reset cannot stop install**: Once state becomes `installing`, `abort` does not interact with `installOnMacFromFile` or `installOnLinuxFromFile`. The `finally` block in `abort` resets state to `idle`, but the native installer may still be running.
+
+## State flow example
+
+```ts
+// 1) Start a download from the nightly feed
+await updater.perform(evt /*, no directUrl */)
+//    Events: start -> download progress... -> ready
+
+// 2) Install the prepared file
+await updater.install()
+//    Events: installing -> (darwin: ends) / (linux: relaunching -> restart)
+
+// 3) Or abort before install
+await updater.abort()
+//    Events: error(Aborted)
+//    State resets to idle; tmpFile is removed if it existed
+```
+
+Any error or abort event always ends with `updateSession = { state: 'idle' }`, making the updater available for a new `perform` call.

@@ -1,0 +1,112 @@
+---
+title: "Native Media Feed Framing"
+sidebarTitle: "Native Media"
+description: "The native media feed binary framing protocol, parser behavior, and boundaries when streaming video, audio, and microphone samples from a helper into the LIVI host."
+---
+
+The native media feed moves compressed video, audio, and microphone samples from a helper process into the LIVI host over a stream socket. The wire format is a lightweight length-prefixed framing protocol implemented in Rust. This page describes the frame layout, parser semantics, supported media kinds, and known limitations.
+
+## Frame layout
+
+Each frame on the wire is a length prefix followed by a 13-byte header and a payload. The full frame size is `4 + 13 + payload.len()` bytes, counted in native endian.
+
+| Offset | Size | Field | Description |
+| --- | --- | --- | --- |
+| 0 | 4 | `len` | Total length of header + payload as `u32` in native endian |
+| 4 | 1 | `kind` | Media type discriminator |
+| 5 | 4 | `id` | Stream identifier as `u32` in native endian |
+| 9 | 8 | `ts` | Timestamp as `u64` in native endian |
+| 17 | `len - 13` | `payload` | Kind-specific data |
+
+The `len` field at offset 0 covers the 13-byte header plus the payload, not the payload alone. Offsets are 0, 4, 5, 9, 17, with the total frame size being `4 + len` bytes on the wire. The parser uses native endian for all multi-byte fields.
+
+## Media kinds
+
+The protocol defines four frame kinds as single-byte constants. The parser does not validate the `kind` byte or the codec payload values. A helper may send any byte and the framer will surface it as long as the record parses correctly.
+
+| Constant | Value | Meaning | Payload semantics |
+| --- | --- | --- | --- |
+| `KIND_VIDEO` | `1` | Video access unit | Encoded video data for the plane `id` |
+| `KIND_AUDIO` | `2` | Audio samples | Encoded audio data for stream `id` |
+| `KIND_VIDEO_START` | `3` | Video stream announcement | One byte: `0` for H.264, `1` for H.265 |
+| `KIND_MIC` | `4` | Microphone samples | Captured microphone data from pipeline to consumer |
+
+The codec byte inside a `KIND_VIDEO_START` payload is `0` for H.264 or `1` for H.265. No other codec identifiers are defined by the constants. The framer treats the `kind` byte and payload as opaque; it does not enforce that `KIND_VIDEO_START` carries a valid codec value, or that `KIND_VIDEO` follows a `KIND_VIDEO_START`.
+
+## Framer behavior
+
+The `Framer` struct collects raw bytes in an internal buffer and yields complete `Record` values once enough bytes have arrived.
+
+### Invariants and rules
+
+- **Partial buffer retention**: Bytes that do not yet form a complete record stay in the internal buffer until the next `push`. There is no timeout or re-sync mechanism.
+- **Undersized frame drain**: If the length prefix indicates a frame smaller than the 13-byte header (`len < 13`), the framer silently drains those bytes and `continue`s the loop. It does not return an error.
+- **Ordered delivery**: Multiple complete records arriving in a single chunk are yielded in order via repeated `next_record` calls.
+- **Empty payload allowed**: A record may carry a zero-length payload as long as `len == 13`.
+
+The `push` method appends bytes with `extend_from_slice`. The `next_record` method reads the prefix, checks buffer sufficiency, validates the size, parses the header fields, copies the payload into a new `Vec<u8>`, then drains the consumed bytes from the internal buffer. The loop means a single call can amortize parsing multiple records, but it also means an undersized prefix does not block the caller; it is skipped immediately.
+
+### Encode path
+
+The `encode` function builds a wire frame from a kind, id, timestamp, and payload slice.
+
+```rust
+pub fn encode(kind: u8, id: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
+    let len = (HEAD_BYTES + payload.len()) as u32;
+    let mut out = Vec::with_capacity(LEN_BYTES + len as usize);
+    out.extend_from_slice(&len.to_ne_bytes());
+    out.push(kind);
+    out.extend_from_slice(&id.to_ne_bytes());
+    out.extend_from_slice(&ts.to_ne_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+```
+
+The encoder computes `len` as `13 + payload.len()`, casts to `u32`, then allocates `with_capacity(4 + len)`. It uses native endian for the `id` and `ts` fields. There is no size-cap guard, checksum, or oversized-frame prevention.
+
+## Boundaries and limitations
+
+Because the protocol is minimal, several classes of errors are not detected or handled:
+
+- **No size cap**: The length prefix may declare arbitrarily large frames. The framer trusts the prefix and allocates accordingly. A huge prefix on a truncated stream causes the framer to wait for that many bytes before making progress, effectively blocking new records.
+- **No checksum or corruption detection**: Bit flips in the length prefix or header are parsed as-is. There is no CRC or magic bytes for re-synchronization.
+- **No timeout or resync**: A partial record sits in the buffer forever if no more bytes arrive. There is no max-age eviction or sync-word search.
+- **Unchecked casts**: `encode` converts `payload.len()` to `u32` without guarding against `usize` values that overflow `u32`. On 64-bit platforms, a payload larger than 4 GiB will wrap silently.
+- **No validation of kind or codec**: The framer does not inspect `kind` or the payload contents. Malformed or unknown kind bytes are passed through.
+- **Timestamp units undefined**: The `ts` field is an opaque `u64`. The protocol does not specify units, frequency, or epoch.
+- **Stream id namespace undefined**: The `id` field is an opaque `u32`. No registration or collision-avoidance semantics are defined.
+- **Audio format unspecified**: `KIND_AUDIO` carries no codec announcement. The consumer must know the expected format out of band.
+- **No endian negotiation**: The protocol uses native endian everywhere. A helper and host running on different architectures will misinterpret the length, id, and timestamp fields.
+
+## Example
+
+A complete Rust example creating and framing a video record:
+
+```rust
+use livi_host_proto::feed::{encode, Framer, Record, KIND_VIDEO};
+
+fn main() {
+    let mut framer = Framer::new();
+
+    // Encode a video frame with a 3-byte payload
+    let wire = encode(KIND_VIDEO, 0x7a00_0001, 42, &[1, 2, 3]);
+    framer.push(&wire);
+
+    // Retrieve the parsed record
+    if let Some(Record { kind, id, ts, payload }) = framer.next_record() {
+        assert_eq!(kind, KIND_VIDEO);
+        assert_eq!(id, 0x7a00_0001);
+        assert_eq!(ts, 42);
+        assert_eq!(payload, vec![1, 2, 3]);
+    }
+}
+```
+
+The framer can also reassemble records split across multiple socket reads by calling `push` with each chunk and then `next_record` once enough bytes have arrived.
+
+## Source reference
+
+The framing implementation lives in `native/livi-host-proto/rust/src/feed.rs`. See the `Record` struct, `Framer` struct with `push` and `next_record`, the `encode` function, and the four `KIND_*` constants.
+
+Source: [native/livi-host-proto/rust/src/feed.rs](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/native/livi-host-proto/rust/src/feed.rs)

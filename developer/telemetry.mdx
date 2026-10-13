@@ -1,0 +1,81 @@
+---
+title: "Telemetry ingestion, merge rules, and IPC wiring"
+sidebarTitle: "Telemetry"
+description: "Understand the telemetry pipeline in LIVI from Socket.IO ingestion through field-level merge rules in TelemetryStore to the IPC and renderer subscription surface."
+---
+
+The telemetry pipeline ingests partial vehicle payloads over Socket.IO, merges them into a single in-memory snapshot, and broadcasts updates to connected socket clients and renderer processes. The main processes are implemented in [`TelemetryStore.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/services/telemetry/TelemetryStore.ts) and [`Socket.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/services/Socket.ts), while the preload bridge exposes renderer-facing helpers in [`index.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/preload/index.ts).
+
+## TelemetryStore merge rules
+
+TelemetryStore is a Node.js `EventEmitter` that maintains one merged state object (`_snapshot`). Calling `merge(patch)` updates the snapshot and emits a `'change'` event carrying the emitted patch plus the updated snapshot.
+
+**Validation and no-ops**
+
+- `null`, `undefined`, non-objects, arrays, or empty objects are silently skipped. Only a non-null, non-array object with at least one key is accepted (`src/main/services/telemetry/TelemetryStore.ts`, `merge`).
+
+**Field-level behavior per key**
+
+| Key | Rule |
+| --- | --- |
+| Top-level key present with value | If the key is `gps` or `can` and the incoming value is a plain object, merge it shallowly. Otherwise replace the existing value. |
+| Top-level key present with `undefined` | Skip entirely. The key is not written to the snapshot, and it is not included in the emitted patch. |
+| Top-level key absent | Leave the existing snapshot value untouched. |
+
+Only fields that arrived in the incoming patch appear in the emitted patch, except for `ts` (see [Timestamps](#timestamps)). The snapshot itself always contains all keys accumulated across prior merges.
+
+**What counts as a "plain object"?** The guard `_isPlainObject` accepts anything where `typeof` is `'object'`, the value is not `null`, and `Array.isArray` is `false`. Date instances, class objects, or prototype constructors are not rejected. The check is minimal and shallow; deeper validation is left to callers.
+
+**Null and replacement** If an incoming top-level field is `null`, that is treated as a valid replacement value and written into the snapshot. Only `undefined` is ignored.
+
+## Timestamps
+
+If the snapshot does not have a `ts` field after merge, `TelemetryStore` assigns `Date.now()`. This sticky timestamp stays on the snapshot until a later patch explicitly provides a new `ts`. The emitted patch carries the same `ts` when one was stamped, so renderers never receive an emitted object without a timestamp even if the caller omitted it.
+
+## Shallow copies and aliasing
+
+The store always returns fresh shallow copies: `snapshot()` returns `{ ...this._snapshot }`, and the `'change'` handler receives `{ ...this._snapshot }`. However, nested sub-objects still share references from the original snapshot. If you hold a reference to `gps.speed` before and after a merge, mutating that inner object would mutate the store. Treat returned objects as read-only.
+
+**Example merge**
+
+```typescript
+const store = new TelemetryStore()
+store.merge({ speed: 42, gps: { lat: 10, lon: 20 } })
+store.merge({ speed: 55, gps: { lat: 11 } })
+// Snapshot:
+// { speed: 55, gps: { lat: 11, lon: 20 }, ts: <number> }
+```
+
+Because `gps` is a nested key and the incoming value is a plain object, the second merge updates `lat` and preserves `lon`. `speed` is a top-level field, so it is overwritten to `55`.
+
+## Socket.IO ingestion
+
+[`TelemetrySocket`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/services/Socket.ts) starts an HTTP server on port `4000` by default with `cors: { origin: '*' }` (`src/main/services/Socket.ts`, `startServer` and constructor).
+
+**New client handshake** On every `connection` event, the server checks `store.snapshot()`. If the snapshot is non-empty, it emits the full snapshot immediately to that socket via the `telemetry:update` event. This guarantees that new clients never start from an empty state.
+
+**Push path** On the `telemetry:push` event, the server calls `store.merge(payload)`. There is no further validation beyond what `TelemetryStore.merge` enforces.
+
+**Broadcast path** Every `TelemetryStore` `'change'` event is re-broadcast as a `telemetry:update` emitting the full snapshot to all connected Socket.IO clients. The system does not send diffs over the wire; every listener receives the complete merged state.
+
+## Lifecycle and error handling
+
+**Connect** `connect()` waits `200` ms then restarts the server. There is no guard against duplicate starts, so a second call while a server is running will create a secondary listener set and a second HTTP server on the same port.
+
+**Disconnect** `disconnect()` unsubscribes from store changes, closes Socket.IO, and closes the underlying HTTP server. It returns a `Promise<void>` that resolves when the HTTP server finishes closing. There is no rejection path if the server is already closed or if an error occurs during teardown.
+
+**Errors** HTTP server errors are logged to the console and not propagated to callers. There is no automatic restart or recovery logic.
+
+**Reset** `TelemetryStore.reset()` silently clears `_snapshot` to `{}`. It does not emit an event, so subscribers will not learn about the reset unless the caller explicitly posts a new `merge` or restarts the socket pipeline.
+
+## Renderer IPC wiring
+
+The preload script maintains a handler list array, `telemetryHandlers`, updated via `onTelemetry` and `offTelemetry`. When the main process posts `telemetry:update` to the renderer, every handler in that list is invoked with the raw payload (`src/preload/index.ts`, `telemetry:update` listener and `onTelemetry`).
+
+| Renderer API | Direction | Main IPC channel | Notes |
+| --- | --- | --- | --- |
+| `onTelemetry(handler)` | Main to renderer | `telemetry:update` (broadcast) | Pushed blindly; renderer has no backpressure buffer. |
+| `offTelemetry(handler)` | Local | N/A | Removes a specific handler from the list. |
+| `getTelemetrySnapshot()` | Renderer to main | `telemetry:snapshot` (invoke) | Returns the current snapshot as a promise. The underlying main handler is not visible in the source bundle. |
+
+There is no invoke-based push from the renderer side; all telemetry flows from main to renderer. The renderer does not buffer updates or provide any read mechanism other than the snapshot helper. The main-to-preload push is a one-way broadcast that does not guarantee ordering relative to other IPC traffic and carries no client-id or sequence metadata.

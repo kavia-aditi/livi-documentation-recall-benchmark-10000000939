@@ -1,0 +1,79 @@
+---
+title: "Transport Arbitration"
+sidebarTitle: "Transport"
+description: "How TransportArbiter ranks wired and wireless candidates, resolves overrides, prepares manual switching, and exports the current projection state."
+---
+
+The `TransportArbiter` class decides which transport candidate (Android Auto or CarPlay, wired or wireless) should be active and exposes the result as a snapshot consumed by the projection UI. It is driven entirely by data from `ArbiterDeps`, which provides session presence, activity status, wireless state, and a change callback. Because candidate comparison logic and several `ArbiterDeps` methods (such as `candidateEquals` and exact runtime hook implementations) are defined outside this module, this page covers only what is present in the arbiter itself.
+
+## Candidate taxonomy
+
+The module defines four concrete candidate objects for `pickPreferred()`, `detectedCandidates()`, and `currentCandidate()`. The order in the internal list is significant because the first detected candidate becomes the fallback when no override or current match exists.
+
+| Candidate | `transport` | `mode` | Notes |
+| --- | --- | --- | --- |
+| `AA_WIRED` | `aa` | `wired` | Primary wired path; always considered first. |
+| `AA_WIRELESS` | `aa` | `wireless` | Offered only when wireless is globally enabled and a prerequisite range or wired AA condition is met. |
+| `CP_WIRED` | `cp` | `wired` | Secondary wired path. |
+| `CP_WIRELESS` | `cp` | `wireless` | Not emitted as a detection candidate in `detectedCandidates()`; may surface as `currentCandidate()` if the active transport is CP and no wired CP session exists. |
+
+The preference sequence wired over wireless and AA over CP is hard-coded in the detection order above.
+
+## Detection rules
+
+The `detectedCandidates()` method builds the candidate list from three conditions ([`TransportArbiter.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/services/projection/transport/TransportArbiter.ts), `detectedCandidates`):
+
+1. **AA wired** is present when `deps.hasWiredAaSession()` is true.
+2. **CP wired** is present when `deps.hasWiredCpSession()` is true.
+3. **AA wireless** is offered only when `deps.isWirelessEnabled()` is true **and** (`isWirelessPhoneInRange()` is true **or** `isWiredAaSessionActive()` is true).
+
+Notably, **CP wireless never appears** as a detected candidate inside `detectedCandidates()`. The arbiter does not currently expose a wireless CarPlay detection path, even if the system may support it elsewhere. There is no active suppression logic that suppresses candidates; detection is strictly additive based on the session and range inputs from `deps`.
+
+## State and override resolution
+
+`pickPreferred()` resolves which candidate should drive projection in three tiers, in this order ([`TransportArbiter.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/services/projection/transport/TransportArbiter.ts), `pickPreferred`):
+
+1. **Override match** — If `this.override` is non-null and matches one of the currently detected candidates (via `candidateEquals`), the override wins.
+2. **Current match** — If `this.currentCandidate()` is non-null and matches a currently detected candidate, the current transport is sticky.
+3. **First detected fallback** — Return `detected[0]`, which follows the wired AA / CP / wireless AA order.
+
+If no candidates are detected at all, `pickPreferred()` returns `null`. Zero candidates short-circuit before any override staleness clearing logic runs, so an override is **not** cleared on an empty detection list. If the override does not match any detected candidate, the arbiter resets the override to `null` and then falls through to step 2 or 3.
+
+`decideNextStart()` simply wraps `pickPreferred()`: when `null`, it returns `{ kind: 'none' }`; otherwise it returns `{ kind: 'start', candidate: target }`.
+
+## Snapshot and UI-facing state
+
+`getSnapshot()` projects the arbiter's internal state into the `TransportSnapshot` contract ([`TransportArbiter.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/services/projection/transport/TransportArbiter.ts), `getSnapshot`):
+
+| Snapshot field | Derivation |
+| --- | --- |
+| `active` | `deps.getActiveTransport()` |
+| `targetTransport` | `override?.transport ?? currentCandidate()?.transport ?? null` |
+| `targetMode` | `override?.mode ?? currentCandidate()?.mode ?? null` |
+| `switchPending` | \`override !== null && (current === null |  | !candidateEquals(override, current))\` |
+| `wiredPhoneDetected` | `hasWiredAaSession() \|\| hasWiredCpSession()` |
+| `wirelessPhoneDetected` | `isWirelessEnabled() && (isWirelessPhoneInRange() \|\| isWiredAaSessionActive() \|\| wirelessActiveNow)` |
+| `wiredPhoneActive` | `isPhoneActive && wired` |
+| `wirelessPhoneActive` | `isPhoneActive && !wired` |
+
+The snapshot intentionally surfaces a wireless detection signal even when wireless is disabled for a running session. `wirelessPhoneDetected` is true when wireless is enabled **and** any of the range, wired AA activity, or active wireless session conditions holds. `switchPending` indicates that an override exists and does not currently match the current candidate. The snapshot does not perform validation on `getActiveTransport()` or mode awareness beyond what the helper methods provide.
+
+## Setters and mutation contract
+
+`setOverride(candidate: Candidate)` immediately stores the candidate, resets any probe defer state, and calls `deps.onChange()` ([`TransportArbiter.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/services/projection/transport/TransportArbiter.ts), `setOverride`). There is no validation that the candidate is detectable or legal. `getOverride()` returns the raw reference, not a copy, so external code should treat it as read-only unless deliberately mutating arbiter state.
+
+`prepareSwitch()` rotates to the next detected candidate relative to an anchor ([`TransportArbiter.ts`](https://github.com/f-io/LIVI/blob/fa5e341d76990a53f13cb7aea6431e17bf5504b3/src/main/services/projection/transport/TransportArbiter.ts), `prepareSwitch`):
+
+- If fewer than two candidates are detected, return `{ ok: false, target: currentCandidate() }`.
+- Anchor on `currentCandidate()` if present, otherwise on the preferred candidate.
+- Find the anchor index in `detectedCandidates()`, wrap to the next entry modulo length, set that as the override, reset the probe state, call `onChange()`, and return `{ ok: true, target: next }`.
+
+No session teardown or start action is issued inside `prepareSwitch()`; the arbiter only updates the intended target.
+
+## Probe state
+
+`nativeProbeDeferred`, `nativeProbeStartedAt`, and `nativeProbeDeadline` are private fields initialized to `false` and `0`. `resetNativeProbeDefer()` sets all three back to their initial values. There is no probing timeout or scheduling logic in this module: deadlines and probe lifetimes are managed by external callers that interact with the arbiter via `setOverride()` or `prepareSwitch()`.
+
+## `hasNativeCandidate()` boundary
+
+This helper returns `true` if a wired AA or wired CP session is present, or if wireless is enabled and a phone is in range. Unlike `detectedCandidates()`, it does **not** include the `isWiredAaSessionActive()` fallback into wireless detection: it strictly uses `isWirelessPhoneInRange()` for the wireless branch. This means `hasNativeCandidate()` may return `false` when `detectedCandidates()` already includes `AA_WIRELESS` because wired AA is active but no phone is currently in wireless range.

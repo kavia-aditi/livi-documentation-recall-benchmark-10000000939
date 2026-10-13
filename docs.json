@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "LIVI Documentation Recall Benchmark",
+  "theme": "palm",
+  "name": "LIVI Developer Documentation",
   "colors": {
     "primary": "#2563EB",
     "light": "#60A5FA",
@@ -10,9 +10,26 @@
   "navigation": {
     "groups": [
       {
-        "group": "Benchmark",
+        "group": "Overview",
         "pages": [
+          "index",
           "README"
+        ]
+      },
+      {
+        "group": "Runtime Behavior",
+        "pages": [
+          "developer/configuration",
+          "developer/transport",
+          "developer/telemetry"
+        ]
+      },
+      {
+        "group": "Integration Boundaries",
+        "pages": [
+          "developer/updates",
+          "developer/renderer-ipc",
+          "developer/native-media"
         ]
       }
     ]

@@ -1,0 +1,43 @@
+---
+title: "LIVI Developer Guide to Runtime and Media Interfaces"
+sidebarTitle: "Introduction"
+description: "Trace LIVI configuration, transport selection, telemetry, updates, renderer IPC, and native media framing through the supplied source bundle."
+---
+
+LIVI's supplied source bundle exposes six implementation boundaries: configuration loading, projection transport selection, telemetry state, software updates, Electron renderer IPC, and native media records. Use this guide to understand the rules implemented in those files, not to assume a complete application contract.
+
+## Explore the Implementation
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="gear" href="/developer/configuration">
+    Follow source selection, adaptive defaults, validation calls, and corrective writes.
+  </Card>
+
+  <Card title="Transport Arbitration" icon="shuffle" href="/developer/transport">
+    Trace candidate ordering, overrides, switching, and transport snapshots.
+  </Card>
+
+  <Card title="Telemetry" icon="tower-broadcast" href="/developer/telemetry">
+    Understand ingestion, partial merges, timestamp retention, and snapshot broadcasts.
+  </Card>
+
+  <Card title="Software Updates" icon="download" href="/developer/updates">
+    Follow download, ready, installation, cancellation, and error paths.
+  </Card>
+
+  <Card title="Renderer IPC" icon="code" href="/developer/renderer-ipc">
+    Inspect exposed methods, channels, callback shapes, and event replay policies.
+  </Card>
+
+  <Card title="Native Media" icon="film" href="/developer/native-media">
+    Read the binary layout and incremental parser's behavior and limits.
+  </Card>
+</CardGroup>
+
+## Evidence and Boundaries
+
+The bundle contains eight implementation files copied from `f-io/LIVI` at commit `fa5e341d76990a53f13cb7aea6431e17bf5504b3`, according to the supplied [provenance page](/README). Each topic cites the relevant file and symbols with immutable source links.
+
+The TypeScript files show calls into dependencies whose implementations are not included. Their full types, validation rules, IPC handlers, platform installers, and runtime wiring remain **unknown** unless explicitly established by the supplied caller. Rust framing tests are evidence of the listed cases, not proof of end-to-end media compatibility.
+
+The visible flow is local to each boundary: configuration returns a validated value; arbitration chooses a candidate without starting a session; Socket.IO inputs merge into the telemetry store and broadcast snapshots; the preload exposes IPC wrappers; the updater delegates installation; and the native framer turns bytes into records. Connections between these components that require omitted files are not asserted.
